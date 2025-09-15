@@ -345,7 +345,21 @@ func main() {
 	client.Start()
 
 	// Example runtime control
-	// client.AddEndpoint(LimitDepth, symbol)
+
+	go func() {
+
+		time.Sleep(5 * time.Second)
+		client.AddEndpoint(LimitDepth, symbol)
+
+	}()
+
+	go func() {
+
+		time.Sleep(20 * time.Second)
+		client.RemoveEndpoint(LimitDepth, symbol)
+
+	}()
+
 	// client.RemoveEndpoint(AggreDeals, symbol)
 
 	<-ctx.Done() // Block until a termination signal
