@@ -24,14 +24,12 @@ type MexcWsClient struct {
 	proxyAddr     string
 	dialer        *websocket.Dialer
 	conn          *websocket.Conn
-	subscriptions map[string]WSEndpoint // topic -> endpoint
-	messageChan   chan *pb.PushDataV3ApiWrapper
-	done          chan struct{}
+	subscriptions map[string]WSEndpoint
 	mutex         sync.Mutex
 	ctx           context.Context
 	cancel        context.CancelFunc
-	missedPings   int
-	symbol        string
+	MissedPings   int
+	pongCh        chan struct{}
 }
 
 // WSEndpoint enumerates reserved endpoints
@@ -49,7 +47,7 @@ var endpointTemplates = map[WSEndpoint]string{
 }
 
 // NewMexcWsClient creates a client and pre-registers provided endpoints (only once each)
-func NewMexcWsClient(url, proxyAddr, symbol string, endpoints ...WSEndpoint) *MexcWsClient {
+func NewMexcWsClient(url, proxyAddr string) *MexcWsClient {
 	socksDialer, err := proxy.SOCKS5("tcp", proxyAddr, nil, proxy.Direct)
 	if err != nil {
 		log.Fatalf("Failed to create SOCKS5 dialer: %v", err)
@@ -61,23 +59,17 @@ func NewMexcWsClient(url, proxyAddr, symbol string, endpoints ...WSEndpoint) *Me
 
 	ctx, cancel := context.WithCancel(context.Background())
 
-	subs := make(map[string]WSEndpoint, len(endpoints))
-	for _, ep := range endpoints {
-		topic := fmt.Sprintf(endpointTemplates[ep], symbol)
-		subs[topic] = ep
-	}
+	subs := make(map[string]WSEndpoint, 0)
 
 	return &MexcWsClient{
 		url:           url,
 		proxyAddr:     proxyAddr,
 		dialer:        dialer,
 		subscriptions: subs,
-		messageChan:   make(chan *pb.PushDataV3ApiWrapper, 100), // Buffered to avoid blocking
-		done:          make(chan struct{}),
 		ctx:           ctx,
 		cancel:        cancel,
-		missedPings:   0,
-		symbol:        symbol,
+		MissedPings:   0,
+		pongCh:        make(chan struct{}, 1),
 	}
 }
 
@@ -132,7 +124,7 @@ func (c *MexcWsClient) RemoveEndpoint(ep WSEndpoint, symbol string) error {
 
 // subscribe sends all current subscriptions (used on connect)
 func (c *MexcWsClient) subscribe() {
-	if c.conn != nil {
+	if c.conn != nil && len(c.subscriptions) > 0 {
 		params := make([]string, 0, len(c.subscriptions))
 		for topic := range c.subscriptions {
 			params = append(params, topic)
@@ -161,7 +153,7 @@ func (c *MexcWsClient) connect() error {
 	}
 
 	c.conn = conn
-	c.missedPings = 0
+	c.MissedPings = 0
 	c.subscribe()
 	return nil
 }
@@ -191,9 +183,13 @@ func (c *MexcWsClient) run() {
 		c.readLoop()
 	}
 }
-
 func (c *MexcWsClient) ping() {
-	ticker := time.NewTicker(30 * time.Second)
+	// Tunable values:
+	pingInterval := 10 * time.Second // how often we send PING
+	pongTimeout := 5 * time.Second   // how long we wait for a PONG after sending PING
+	maxMissed := 2                   // how many consecutive misses before reconnect
+
+	ticker := time.NewTicker(pingInterval)
 	defer ticker.Stop()
 
 	for {
@@ -201,18 +197,51 @@ func (c *MexcWsClient) ping() {
 		case <-c.ctx.Done():
 			return
 		case <-ticker.C:
+			// ensure single point to write
 			c.mutex.Lock()
 			if c.conn == nil {
 				c.mutex.Unlock()
 				return
 			}
-			err := c.conn.WriteJSON(map[string]string{"method": "PING"})
-			if err != nil {
-				log.Printf("Failed to send ping: %v", err)
+			if err := c.conn.WriteJSON(map[string]string{"method": "PING"}); err != nil {
+				// write failed -> force reconnect
+				log.Printf("Failed to send ping: %v; closing connection for reconnect", err)
 				c.conn.Close()
 				c.conn = nil
+				c.mutex.Unlock()
+				return
 			}
 			c.mutex.Unlock()
+
+			// Wait for PONG or timeout
+			select {
+			case <-c.ctx.Done():
+				return
+			case <-c.pongCh:
+				// got pong, reset counter
+				c.mutex.Lock()
+				c.MissedPings = 0
+				c.mutex.Unlock()
+			case <-time.After(pongTimeout):
+				// timeout waiting for pong
+				c.mutex.Lock()
+				c.MissedPings++
+				missed := c.MissedPings
+				c.mutex.Unlock()
+
+				log.Printf("PONG timeout (missed %d)", missed)
+
+				if missed > maxMissed {
+					log.Printf("Missed pongs (%d) > %d; closing connection to trigger reconnect", missed, maxMissed)
+					c.mutex.Lock()
+					if c.conn != nil {
+						c.conn.Close()
+						c.conn = nil
+					}
+					c.mutex.Unlock()
+					return
+				}
+			}
 		}
 	}
 }
@@ -289,13 +318,17 @@ func (c *MexcWsClient) readLoop() {
 			if err := json.Unmarshal(message, &resp); err == nil {
 				if msg, ok := resp["msg"].(string); ok {
 					if msg == "PONG" {
+						// notify the ping goroutine (non-blocking)
+						select {
+						case c.pongCh <- struct{}{}:
+						default:
+						}
 						c.mutex.Lock()
-						c.missedPings = 0
+						c.MissedPings = 0
 						c.mutex.Unlock()
-					} else if msg == "PING" { // Handle potential server ping
+					} else if msg == "PING" {
 						c.conn.WriteJSON(map[string]string{"method": "PONG"})
 					}
-					// For subscription responses
 					if code, ok := resp["code"].(float64); ok && code != 0 {
 						log.Printf("Subscription error: %+v", resp)
 					}
@@ -325,7 +358,6 @@ func (c *MexcWsClient) Stop() {
 	}
 	c.mutex.Unlock()
 
-	close(c.messageChan)
 }
 
 func main() {
@@ -341,22 +373,30 @@ func main() {
 	)
 	defer stop()
 
-	client := NewMexcWsClient(wsURL, proxyAddr, symbol, LimitDepth, AggreDeals)
+	client := NewMexcWsClient(wsURL, proxyAddr)
 	client.Start()
 
 	// Example runtime control
 
+	// go func() {
+
+	// 	time.Sleep(5 * time.Second)
+	// 	client.AddEndpoint(LimitDepth, symbol)
+
+	// }()
+
+	// go func() {
+
+	// 	time.Sleep(5 * time.Second)
+	// 	client.RemoveEndpoint(LimitDepth, symbol)
+
+	// }()
+
+
 	go func() {
 
-		time.Sleep(5 * time.Second)
+
 		client.AddEndpoint(LimitDepth, symbol)
-
-	}()
-
-	go func() {
-
-		time.Sleep(20 * time.Second)
-		client.RemoveEndpoint(LimitDepth, symbol)
 
 	}()
 
